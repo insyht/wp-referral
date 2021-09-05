@@ -3,6 +3,7 @@
 namespace IWS\Referral\Services;
 
 use IWS\Referral\Helpers\ReferralHelper;
+use WC_Order;
 
 class ReferralService
 {
@@ -23,11 +24,6 @@ class ReferralService
     {
         add_role(ReferralHelper::IWS_REFERRAL_ROLE, 'Referrer');
 
-        foreach (get_users() as $user) {
-            add_user_meta($user->ID, ReferralHelper::IWS_REFERRAL_CODE_COLUMN, md5(uniqid()), true);
-            add_user_meta($user->ID, ReferralHelper::IWS_REFERRAL_POINTS_COLUMN, 0);
-        }
-
         $createLogTableQueryTemplate = '
         CREATE TABLE `%s` (
             `id` INT(10) UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -46,12 +42,16 @@ class ReferralService
 
     public function deactivatePlugin(): void
     {
-        remove_role(ReferralHelper::IWS_REFERRAL_ROLE);
-
-        foreach (get_users() as $user) {
+        foreach (get_users(['role' => ReferralHelper::IWS_REFERRAL_ROLE]) as $user) {
+            /** @var \WP_User $user */
+            $user->add_role('customer');
+            $user->remove_role(ReferralHelper::IWS_REFERRAL_ROLE);
+            $this->referralHelper->deleteCoupon($this->referralHelper->generateCodeForUser($user));
             delete_user_meta($user->ID, ReferralHelper::IWS_REFERRAL_CODE_COLUMN);
             delete_user_meta($user->ID, ReferralHelper::IWS_REFERRAL_POINTS_COLUMN);
         }
+
+        remove_role(ReferralHelper::IWS_REFERRAL_ROLE);
 
         $deleteLogTableQueryTemplate = 'DROP TABLE `%s`;';
         $deleteLogTableQuery = sprintf(
@@ -61,10 +61,35 @@ class ReferralService
         $this->database->query($deleteLogTableQuery);
     }
 
+    public function updateMetaDataForUser(int $userId): void
+    {
+        $user = get_user_by('ID', $userId);
+        if (in_array(ReferralHelper::IWS_REFERRAL_ROLE, $user->roles)) {
+            $this->setMetaDataForUser($userId);
+        } else {
+            $this->unsetMetaDataForUser($userId);
+        }
+    }
+
     public function setMetaDataForUser(int $userId): void
     {
-        add_user_meta($userId, ReferralHelper::IWS_REFERRAL_CODE_COLUMN, md5(uniqid()), true);
+        $user = get_user_by('ID', $userId);
+        $this->referralHelper->createCoupon($user);
+        add_user_meta(
+            $userId,
+            ReferralHelper::IWS_REFERRAL_CODE_COLUMN,
+            $this->referralHelper->generateCodeForUser(get_user_by('id', $userId)),
+            true
+        );
         add_user_meta($userId, ReferralHelper::IWS_REFERRAL_POINTS_COLUMN, 0);
+    }
+
+    public function unsetMetaDataForUser(int $userId): void
+    {
+        $user = get_user_by('ID', $userId);
+        $this->referralHelper->deleteCoupon($this->referralHelper->generateCodeForUser($user));
+        delete_user_meta($userId, ReferralHelper::IWS_REFERRAL_CODE_COLUMN);
+        delete_user_meta($userId, ReferralHelper::IWS_REFERRAL_POINTS_COLUMN);
     }
 
     public function showDataForCurrentUser(): void
@@ -76,17 +101,13 @@ class ReferralService
                 'referral_code',
                 [
                     'type' => 'text',
-                    'label' => 'Referral url toevoeging',
+                    'label' => 'Kortingscode',
                     'hide_in_account' => false,
                     'hide_in_admin' => true,
                     'hide_in_checkout' => true,
                     'hide_in_registration' => true,
                     'custom_attributes' => ['disabled' => true],
-                    'default' => sprintf(
-                        '?%s=%s',
-                        ReferralHelper::IWS_REFERRAL_QUERY_VAR,
-                        $this->referralHelper->getCodeForCurrentUser()
-                    ),
+                    'default' => $this->referralHelper->getCodeForCurrentUser(),
                 ]
             );
             woocommerce_form_field(
@@ -105,14 +126,23 @@ class ReferralService
         }
     }
 
-    public function determineAwardedPoints(int $orderId): int
+    public function determineAwardedPoints(WC_Order $order): int
     {
         return 1;
     }
 
     public function savePoints(int $orderId): void
     {
-        $referralCode = $this->referralHelper->getCodeFromSession();
+        $postPayMethods = [
+          'bacs',
+          'mollie_wc_gateway_banktransfer',
+        ];
+        $order = wc_get_order($orderId);
+        if (in_array($order->get_payment_method(), $postPayMethods)) {
+            return;
+        }
+
+        $referralCode = $this->referralHelper->getCodeFromOrder($order);
         if ($referralCode === null) {
             return;
         }
@@ -124,7 +154,7 @@ class ReferralService
 
         global $wpdb;
 
-        $amountOfPoints = $this->determineAwardedPoints($orderId);
+        $amountOfPoints = $this->determineAwardedPoints($order);
         $reason = sprintf('Order #%d placed', $orderId);
 
         $checkIfAlreadyDoneQueryTemplate = 'SELECT `reason` FROM `%s` WHERE `reason` = "%s" LIMIT 1;';
